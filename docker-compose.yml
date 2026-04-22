@@ -1,0 +1,234 @@
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    ports:
+      - 3000:3000
+    volumes:
+      - ./homepage:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    ports:
+      - 9000:9000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:latest
+    container_name: uptime-kuma
+    ports:
+      - 3002:3001
+    volumes:
+      - uptime_kuma_data:/app/data
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - 9090:9090
+    volumes:
+      - ./prometheus:/etc/prometheus
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  grafana:
+    image: grafana/grafana-oss
+    container_name: grafana
+    ports:
+      - 3001:3000
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: jenkins
+    ports:
+      - 8080:8080
+    volumes:
+      - jenkins_data:/var/jenkins_home
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  duckdns:
+    image: lscr.io/linuxserver/duckdns:latest
+    container_name: duckdns
+    restart: unless-stopped
+    environment:
+      - SUBDOMAINS=vaultsh            # Your 'vaultsh' name
+      - TOKEN=${DUCKDNS_TOKEN}        # This pulls from the .env file
+      - LOG_FILE=false                # Keeps logs clean
+    networks:
+      - homepage_network
+
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    ports:
+      - "8081:80"
+    volumes:
+      - vaultwarden_data:/data
+    environment:
+      DOMAIN: "https://vault-server.tail0bd619.ts.net/"
+      SIGNUPS_ALLOWED: "true"
+      WEBSOCKET_ENABLED: "true"
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./homeassistant:/config
+    restart: unless-stopped
+
+  adguardhome:
+    image: adguard/adguardhome
+    container_name: adguardhome
+    restart: unless-stopped
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "3003:80/tcp"  # Changed from 3000 to 80
+    volumes:
+      - ./adguard/work:/opt/adguardhome/work
+      - ./adguard/conf:/opt/adguardhome/conf
+    networks:
+      - homepage_network
+
+  database:
+    build: ./postgres
+    container_name: immich-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: immich
+      POSTGRES_PASSWORD: example
+      POSTGRES_DB: immich
+    ports:
+      - "5432:5432"
+    volumes:
+      - immich_data:/var/lib/postgresql/data
+    networks:
+      - homepage_network  # <--- THIS WAS MISSING
+
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich-server
+    depends_on:
+      - database
+      - redis
+    ports:
+      - "2283:2283"
+    environment:
+      # Use the SERVICE NAME 'database' or ensure both are on the same network
+      DB_HOSTNAME: database 
+      DB_USERNAME: immich    # Changed to match POSTGRES_USER above
+      DB_PASSWORD: example   # Changed to match POSTGRES_PASSWORD above
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: immich-redis
+      IMMICH_HOST: 0.0.0.0  # <--- THIS IS THE KEY FIX
+      IMMICH_PORT: 2283
+    volumes:
+      - ./immich/upload:/usr/src/app/upload
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  redis:
+    image: redis:6
+    container_name: immich-redis
+    restart: unless-stopped
+    networks:
+      - homepage_network
+
+  # # MOVED INSIDE SERVICES AND INDENTED PROPERLY
+  # tunnel:
+  #   container_name: cloudflared-tunnel
+  #   image: cloudflare/cloudflared:latest
+  #   restart: unless-stopped
+  #   command: tunnel --url http://vaultwarden:80
+  #   environment:
+  #     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+  #   networks:
+  #     - homepage_network
+
+# NEW: Dedicated tailscale for Immich
+  tailscale-immich:
+    image: tailscale/tailscale:latest
+    container_name: tailscale-immich
+    hostname: immich-server
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - tailscale_immich_data:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - homepage_network
+    command: >
+      sh -c "tailscaled --state=/var/lib/tailscale/tailscaled.state & 
+             sleep 5; 
+             tailscale up --authkey=$${TS_AUTHKEY};
+             # Point to the gateway of the bridge network (usually the host)
+             tailscale serve --bg http://172.21.0.1:2283; 
+             wait"
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    hostname: vault-server
+    # ports:
+    #   - "443:443"
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}  # We will get this in Step 2
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - tailscale_data:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun # Required for network tunneling
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    restart: unless-stopped
+    networks:
+      - homepage_network
+    command: tailscale serve --bg http://vaultwarden:80
+networks:
+  homepage_network:
+    driver: bridge
+
+
+volumes:
+  tailscale_data:
+  portainer_data:
+  grafana_data:
+  uptime_kuma_data:
+  jenkins_data:
+  vaultwarden_data:
+  homeassistant_data:
+  caddy_data:      # Added this
+  caddy_config:    # Added this
+  immich_data:
+  pgdata:
+  tailscale_immich_data:
